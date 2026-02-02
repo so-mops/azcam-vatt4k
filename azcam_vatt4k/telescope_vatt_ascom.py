@@ -346,7 +346,7 @@ class VattAscom(Telescope):
         return ["OK"]
 
     # **************************************************************************************************
-    # Move – Az/Alt (optional, for observe.azalt_mode via 'telescope.move_azalt')
+    # Move – Az/Alt (for observe.azalt_mode via 'telescope.move_azalt')
     # **************************************************************************************************
     def move_azalt(self, Az, Alt):
         """
@@ -447,13 +447,14 @@ class VattAscom(Telescope):
     # **************************************************************************************************
     # Wait for telescope motion to complete
     # **************************************************************************************************
-    def wait_for_move(self, timeout=None):
-        """
-        Wait for telescope to stop moving.
-        Uses Alpaca Slewing property and optional timeout.
-        timeout: seconds, or None for no timeout (loop until stopped).
-        """
-
+    def wait_for_move(
+        self,
+        timeout: float = 300.0,
+        start_timeout: float = 2.0,
+        stop_grace: float = 1.0,
+        poll: float = 0.1,
+        log_every: float = 1.0,
+    ):
         if not self.is_enabled:
             azcam.exceptions.warning("telescope not enabled")
             return ["WARNING", "telescope not enabled"]
@@ -462,39 +463,65 @@ class VattAscom(Telescope):
             azcam.log("DEBUG wait_for_move (no actual waiting)")
             return ["OK", "DEBUG"]
 
-        azcam.log("Checking for telescope motion...")
-        start = time.time()
-        cycle = 0
-
-        while True:
+        def _read_slewing():
             try:
-                motion = bool(self.tserver.Slewing)
+                return bool(self.tserver.Slewing), None
             except Exception as e:
-                msg = f"Error reading Slewing status: {e}"
+                return None, e
+
+        azcam.log("Checking for telescope motion...")
+
+        t0 = time.time()
+        last_log = 0.0
+
+        while (time.time() - t0) < start_timeout:
+            slewing, err = _read_slewing()
+            if err is not None:
+                msg = f"Error reading Slewing status: {err}"
                 azcam.log(msg)
                 return ["ERROR", msg]
+            if slewing:
+                break
+            time.sleep(poll)
 
-            if not motion:
-                azcam.log("Telescope reports it is STOPPED")
-                # Log coords a few times, similar to old wait_for_move
-                for _ in range(3):
-                    ra = self.get_keyword("RA")[0]
-                    dec = self.get_keyword("DEC")[0]
-                    azcam.log(f"Coords: {ra} {dec}")
-                return ["OK"]
+        stop_start = None
 
-            # still moving – log occasionally
-            ra = self.get_keyword("RA")[0]
-            dec = self.get_keyword("DEC")[0]
-            azcam.log(f"Coords: {ra} {dec}")
-
-            if timeout is not None and (time.time() - start) > timeout:
+        while True:
+            elapsed = time.time() - t0
+            if elapsed > timeout:
                 azcam.log("Telescope motion TIMEOUT - sending AbortSlew()")
                 try:
                     self.tserver.AbortSlew()
                 except Exception as e:
                     azcam.log(f"AbortSlew failed: {e}")
-                return ["ERROR", "timeout waiting for telescope motion"]
+                return ["ERROR", f"timeout waiting for telescope motion ({timeout:.0f}s)"]
 
-            time.sleep(0.1)
-            cycle += 1
+            slewing, err = _read_slewing()
+            if err is not None:
+                msg = f"Error reading Slewing status: {err}"
+                azcam.log(msg)
+                return ["ERROR", msg]
+
+            if (time.time() - last_log) >= log_every:
+                try:
+                    ra = self.get_keyword("RA")[0]
+                    dec = self.get_keyword("DEC")[0]
+                    azcam.log(f"Slewing={int(slewing)}  Coords: {ra} {dec}")
+                except Exception:
+                    azcam.log(f"Slewing={int(slewing)}  Coords: (unavailable)")
+                last_log = time.time()
+
+            if slewing:
+                stop_start = None
+            else:
+                if stop_start is None:
+                    stop_start = time.time()
+                if (time.time() - stop_start) >= stop_grace:
+                    azcam.log("Telescope reports it is STOPPED")
+                    for _ in range(2):
+                        ra = self.get_keyword("RA")[0]
+                        dec = self.get_keyword("DEC")[0]
+                        azcam.log(f"Final Coords: {ra} {dec}")
+                    return ["OK"]
+
+            time.sleep(poll)
