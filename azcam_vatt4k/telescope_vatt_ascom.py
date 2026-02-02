@@ -149,7 +149,7 @@ class VattAscom(Telescope):
             elif keyword == "AIRMASS":
                 value = getattr(self.tserver, "Altitude")
                 secz = 1.0 / math.cos((90.0 - value) * math.pi / 180.0)
-                reply = f"{secz:.02}"
+                reply = f"{secz:.2f}"
 
             elif keyword == "HA":
                 lst = getattr(self.tserver, self.fits_keywords["LST-OBS"][0])
@@ -178,7 +178,7 @@ class VattAscom(Telescope):
 
             elif keyword == "ELEVAT":
                 value = getattr(self.tserver, self.fits_keywords[keyword][0])
-                reply = f"{value:.03}"
+                reply = f"{value:.3f}"
 
             elif keyword == "MOTION":
                 value = getattr(self.tserver, self.fits_keywords[keyword][0])
@@ -186,11 +186,11 @@ class VattAscom(Telescope):
 
             elif keyword == "AZIMUTH":
                 value = getattr(self.tserver, self.fits_keywords[keyword][0])
-                reply = f"{value:.04}"
+                reply = f"{value:.4f}"
 
             elif keyword == "ROTANGLE":
                 value = getattr(self.rserver, self.fits_keywords[keyword][0])
-                reply = f"{value:.04}"
+                reply = f"{value:.4f}"
 
             elif keyword == "ST":
                 value = getattr(self.tserver, self.fits_keywords[keyword][0])
