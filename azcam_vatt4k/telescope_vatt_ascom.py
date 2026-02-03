@@ -215,7 +215,7 @@ class VattAscom(Telescope):
             reply, t = self.header.convert_type(reply, self.fits_keywords[keyword][2])
 
         except Exception as e:
-            azcam.log(f"header error for keyword {keyword}: {e}")
+            self._log_safe(f"header error for keyword {keyword}: {e}")
             reply = ""
             t = "str"
 
@@ -244,6 +244,10 @@ class VattAscom(Telescope):
         """
         ang = Angle(angle_str)
         return ang.degree
+
+    def _log_safe(self, msg):
+        s = "" if msg is None else str(msg)
+        azcam.log(s.replace("{", "{{").replace("}", "}}"))
 
     # **************************************************************************************************
     # Focus
@@ -298,14 +302,14 @@ class VattAscom(Telescope):
         try:
             self.tserver.Tracking = True
         except Exception as e:
-            azcam.log(f"Could not set Tracking=True: {e}")
+            self._log_safe(f"Could not set Tracking=True: {e}")
 
         try:
             # async slew, then we wait below
             self.tserver.SlewToCoordinatesAsync(ra_hours, dec_degs)
         except Exception as e:
             msg = f"SlewToCoordinatesAsync failed: {e}"
-            azcam.log(msg)
+            self._log_safe(msg)
             return ["ERROR", msg]
 
         reply = self.wait_for_move()
@@ -333,13 +337,13 @@ class VattAscom(Telescope):
         try:
             self.tserver.Tracking = True
         except Exception as e:
-            azcam.log(f"Could not set Tracking=True: {e}")
+            self._log_safe(f"Could not set Tracking=True: {e}")
 
         try:
             self.tserver.SlewToCoordinatesAsync(ra_hours, dec_degs)
         except Exception as e:
             msg = f"SlewToCoordinatesAsync failed in move_start: {e}"
-            azcam.log(msg)
+            self._log_safe(msg)
             return ["ERROR", msg]
 
         # do not wait here
@@ -349,11 +353,6 @@ class VattAscom(Telescope):
     # Move – Az/Alt (for observe.azalt_mode via 'telescope.move_azalt')
     # **************************************************************************************************
     def move_azalt(self, Az, Alt):
-        """
-        Move telescope to an absolute Az/Alt position.
-        Called by observe in azalt_mode via 'telescope.move_azalt Az Alt'.
-        """
-
         if not self.is_enabled:
             return ["WARNING", "telescope not enabled"]
 
@@ -361,26 +360,33 @@ class VattAscom(Telescope):
             azcam.log(f"DEBUG move_azalt: Az={Az}, Alt={Alt}")
             return ["OK", "DEBUG"]
 
-        az_deg = self._parse_angle(Az)
-        alt_deg = self._parse_angle(Alt)
+        try:
+            az_deg = float(self._parse_angle(Az))
+            alt_deg = float(self._parse_angle(Alt))
+        except Exception as e:
+            msg = f"Bad Az/Alt values Az={Az} Alt={Alt}: {e}"
+            self._log_safe(msg)
+            return ["ERROR", msg]
+
+        az_deg = az_deg % 360.0
+        if alt_deg < -90.0 or alt_deg > 90.0:
+            return ["ERROR", f"Alt out of range: {alt_deg}"]
 
         azcam.log(f"VattAscom.move_azalt: AZ={az_deg:.3f} deg, ALT={alt_deg:.3f} deg")
 
         try:
             self.tserver.Tracking = True
         except Exception as e:
-            azcam.log(f"Could not set Tracking=True: {e}")
+            self._log_safe(f"Could not set Tracking=True: {e}")
 
         try:
-            # async Alt/Az slew
             self.tserver.SlewToAltAzAsync(az_deg, alt_deg)
         except Exception as e:
             msg = f"SlewToAltAzAsync failed: {e}"
-            azcam.log(msg)
+            self._log_safe(msg)
             return ["ERROR", msg]
 
-        reply = self.wait_for_move()
-        return reply
+        return self.wait_for_move()
 
     # **************************************************************************************************
     # Offset – small RA/Dec shifts in arcseconds (used by 'steptel')
@@ -404,7 +410,7 @@ class VattAscom(Telescope):
             dec_arcsec = float(Dec)
         except Exception as e:
             msg = f"Bad offset values RA={RA} Dec={Dec}: {e}"
-            azcam.log(msg)
+            self._log_safe(msg)
             return ["ERROR", msg]
 
         # Current coordinates from Alpaca
@@ -432,13 +438,13 @@ class VattAscom(Telescope):
         try:
             self.tserver.Tracking = True
         except Exception as e:
-            azcam.log(f"Could not set Tracking=True: {e}")
+            self._log_safe(f"Could not set Tracking=True: {e}")
 
         try:
             self.tserver.SlewToCoordinatesAsync(new_ra_hours, new_dec_deg)
         except Exception as e:
             msg = f"SlewToCoordinatesAsync failed in offset: {e}"
-            azcam.log(msg)
+            self._log_safe(msg)
             return ["ERROR", msg]
 
         reply = self.wait_for_move()
@@ -478,7 +484,7 @@ class VattAscom(Telescope):
             slewing, err = _read_slewing()
             if err is not None:
                 msg = f"Error reading Slewing status: {err}"
-                azcam.log(msg)
+                self._log_safe(msg)
                 return ["ERROR", msg]
             if slewing:
                 break
@@ -493,13 +499,13 @@ class VattAscom(Telescope):
                 try:
                     self.tserver.AbortSlew()
                 except Exception as e:
-                    azcam.log(f"AbortSlew failed: {e}")
+                    self._log_safe(f"AbortSlew failed: {e}")
                 return ["ERROR", f"timeout waiting for telescope motion ({timeout:.0f}s)"]
 
             slewing, err = _read_slewing()
             if err is not None:
                 msg = f"Error reading Slewing status: {err}"
-                azcam.log(msg)
+                self._log_safe(msg)
                 return ["ERROR", msg]
 
             if (time.time() - last_log) >= log_every:
