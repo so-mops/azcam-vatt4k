@@ -1,6 +1,7 @@
 import time
 import re
 import socket
+import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
@@ -171,6 +172,8 @@ class VattInstrumentIndi(Instrument):
         self._names_cache = {"upper": None, "lower": None}
         self._names_cache_t = 0.0
 
+        self._move_lock = threading.Lock()
+
     # -------- internal helpers --------
 
     def _names(self, wheel: str) -> Dict[int, str]:
@@ -232,18 +235,30 @@ class VattInstrumentIndi(Instrument):
             )
         return slot
 
-    def _wait_confirm(self, wheel: str, expected_label: str, timeout: float = 90.0, poll: float = 1) -> None:
+    def _wait_confirm(self, wheel: str, expected_label: str, timeout: float = 90.0, poll: float = 1.0, min_move_time: float = 0.8) -> None:
+        expected_label = (expected_label or "").strip()
+        if not expected_label:
+            raise azcam.exceptions.AzcamError("Expected label is empty; cannot confirm move.")
+
         t0 = time.time()
+        saw_expected_once = False
+
         while True:
-            cur = self.indi.getfilters(retries=1)
-            cur_label = (cur.get(wheel) or "").strip()
-            if cur_label == expected_label:
-                return
+            cur_label = (self.indi.getfilters(retries=1).get(wheel) or "").strip()
+
+            # Don't accept success too quickly
+            if (time.time() - t0) >= min_move_time and cur_label == expected_label:
+                if saw_expected_once:
+                    return
+                saw_expected_once = True
+            else:
+                saw_expected_once = False
+
             if (time.time() - t0) > timeout:
                 raise azcam.exceptions.AzcamError(
-                    f"Timeout waiting for {wheel} wheel to reach '{expected_label}'. "
-                    f"Currently '{cur_label}'."
+                    f"Timeout waiting for {wheel} wheel to reach '{expected_label}'. last='{cur_label}'."
                 )
+
             time.sleep(poll)
 
     # -------- required AzCam Instrument API --------
@@ -284,31 +299,40 @@ class VattInstrumentIndi(Instrument):
 
     def set_filter(self, filter_name, filter_id=0):
         """
-        Set a wheel filter. REQUIRE explicit wheel prefix.
-        Examples:
-          set_filter('upper:U') # filter name
-          set_filter('lower:3') # filter position
+        Stable filter set:
+          - Requires explicit wheel prefix.
+          - Short-circuits if already at requested filter.
+          - Serializes moves with a lock.
+          - Uses robust confirmation to avoid stale/instant success.
         """
-        wheel, value = self._parse_wheel_value(filter_name)
+        with self._move_lock:
+            wheel, value = self._parse_wheel_value(filter_name)
 
-        # Resolve to slot
-        slot = self._resolve_to_slot(wheel, value)
+            # Resolve to slot
+            slot = self._resolve_to_slot(wheel, value)
 
-        # Determine expected label from live names
-        names = self._names(wheel)
-        expected_label = (names.get(slot) or "").strip()
-        if expected_label == "":
-            raise azcam.exceptions.AzcamError(
-                f"Resolved slot {slot} on {wheel} wheel but label is empty/unknown."
-            )
+            # Determine expected label from live names
+            names = self._names(wheel)
+            expected_label = (names.get(slot) or "").strip()
+            if expected_label == "":
+                raise azcam.exceptions.AzcamError(
+                    f"Resolved slot {slot} on {wheel} wheel but label is empty/unknown."
+                )
 
-        azcam.log(f"Setting {wheel} wheel to slot {slot} ('{expected_label}')")
+            # if already in place, do not send a move command
+            cur = self.indi.getfilters(retries=2)
+            cur_label = (cur.get(wheel) or "").strip()
+            if cur_label == expected_label:
+                azcam.log(f"{wheel} wheel already at '{expected_label}' (slot {slot}); no move needed")
+                return self.get_filter(filter_id=0)
 
-        # Command move
-        self.indi.set_wheel_slot(wheel, slot)
+            azcam.log(f"Setting {wheel} wheel to slot {slot} ('{expected_label}') from '{cur_label}'")
 
-        # Confirm via FILTERS telemetry
-        self._wait_confirm(wheel, expected_label, timeout=90.0, poll=1)
+            # Command move
+            self.indi.set_wheel_slot(wheel, slot)
 
-        # Return both wheels state
-        return self.get_filter(filter_id=0)
+            # Confirm via FILTERS telemetry
+            self._wait_confirm(wheel, expected_label, timeout=90.0, poll=1.0, min_move_time=0.8)
+
+            # Return both wheels state
+            return self.get_filter(filter_id=0)
