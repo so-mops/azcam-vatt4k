@@ -13,7 +13,7 @@ from azcam.server import setup_server
 import azcam.shortcuts
 from azcam.cmdserver import CommandServer
 from azcam.header import System
-from azcam.tools.instrument import Instrument
+from azcam_vatt4k.instrument_vatt_indi import VattInstrumentIndi
 from azcam.tools.arc.controller_arc import ControllerArc
 from azcam.tools.arc.exposure_arc import ExposureArc
 from azcam.tools.arc.tempcon_arc import TempConArc
@@ -115,8 +115,9 @@ def setup():
     ]
     exposure.image.focalplane.rdnoises = [4.0, 4.0]
 
-    # instrument (not used)
-    instrument = Instrument()
+    # instrument
+    instrument = VattInstrumentIndi()
+    instrument.initialize()
 
     # telescope
     telescope = VattAscom()
