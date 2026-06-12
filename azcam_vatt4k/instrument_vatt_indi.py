@@ -94,35 +94,226 @@ class VattIndiGuidebox:
         self.cfg = cfg or IndiConfig()
         self._tcp = IndiTcpClient(self.cfg)
 
+        # These regexes are only socket read terminators / message-payload parsers.
+        # XML element extraction below is handled by ElementTree, matching the
+        # secondary-axis implementation pattern.
+        self._filters_until_re = re.compile(
+            r"<message\b"
+            r"(?=[^>]*\bdevice=[\"']" + re.escape(self.QUERY_DEVICE) + r"[\"'])"
+            r"(?=[^>]*\bmessage=[\"']upper:)"
+            r"[^>]*>",
+            re.S,
+        )
+        self._text_vector_done_re = re.compile(r"</(?:defTextVector|setTextVector)>")
+        self._filter_message_re = re.compile(r"upper:(.+?)\s+lower:(.+)$")
+
     def _send_recv(self, payload: str, max_wait: float, until=None) -> str:
         return self._tcp.send_recv(payload, max_wait=max_wait, until=until)
 
+    @staticmethod
+    def _tag_name(elem: ET.Element) -> str:
+        """
+        Return the local XML tag name, tolerating namespaced XML if it ever appears.
+        """
+        tag = elem.tag
+        if "}" in tag:
+            return tag.rsplit("}", 1)[-1]
+        return tag
+
+    def _iter_xml_elements_wrapped(self, buf: str):
+        """
+        Parse a buffer containing one or more complete INDI XML stanzas by
+        wrapping it in a synthetic root element.
+        """
+        wrapped = f"<root>{buf}</root>"
+        root = ET.fromstring(wrapped)
+        for elem in root.iter():
+            if elem is not root:
+                yield elem
+
+    def _iter_xml_elements_pull(self, buf: str):
+        """
+        Streaming parse fallback for truncated buffers.
+
+        This mirrors the secondary parser's recovery strategy: yield any
+        complete XML elements already present in the response, even if the
+        final stanza is incomplete.
+        """
+        parser = ET.XMLPullParser(events=("end",))
+
+        try:
+            parser.feed("<root>")
+            parser.feed(buf)
+        except ET.ParseError:
+            # Keep any completed elements that the parser accepted before
+            # encountering malformed or truncated trailing XML.
+            pass
+
+        try:
+            for _event, elem in parser.read_events():
+                if elem.tag != "root":
+                    yield elem
+        except ET.ParseError:
+            return
+
+        try:
+            parser.feed("</root>")
+            for _event, elem in parser.read_events():
+                if elem.tag != "root":
+                    yield elem
+            parser.close()
+        except ET.ParseError:
+            # The buffer was truncated or otherwise incomplete; completed
+            # elements have already been yielded.
+            return
+
+    def _xml_elements(self, buf: str) -> List[ET.Element]:
+        """
+        Return XML elements from an INDI response buffer.
+
+        Prefer strict wrapped parsing when the response is complete. Fall back
+        to XMLPullParser when the socket buffer is truncated.
+        """
+        if not buf:
+            return []
+
+        try:
+            return list(self._iter_xml_elements_wrapped(buf))
+        except ET.ParseError:
+            return list(self._iter_xml_elements_pull(buf))
+
+    def _parse_filter_message(self, message: str) -> Optional[Dict[str, str]]:
+        """
+        Parse the FILTERS driver's message payload.
+
+        The payload itself is not structured XML; it is the value of the XML
+        message attribute and is expected to look like:
+            upper:Clear lower:U
+        """
+        m = self._filter_message_re.search((message or "").strip())
+        if not m:
+            return None
+
+        return {
+            "upper": m.group(1).strip(),
+            "lower": m.group(2).strip(),
+        }
+
+    def _parse_filters_xml(self, xml: str) -> Optional[Dict[str, str]]:
+        """
+        Extract current in-beam filters from parsed INDI XML message elements.
+        """
+        match_any = None
+        match_device = None
+
+        for elem in self._xml_elements(xml):
+            message = elem.attrib.get("message")
+            if not message:
+                continue
+
+            parsed = self._parse_filter_message(message)
+            if parsed is None:
+                continue
+
+            match_any = parsed
+
+            dev = (elem.attrib.get("device") or "").strip()
+            if dev == self.QUERY_DEVICE:
+                match_device = parsed
+
+        return match_device or match_any
+
+    @staticmethod
+    def _clean_text_value(value: Optional[str]) -> str:
+        """
+        Match the previous behavior for filter-name text values:
+        collapse internal whitespace and strip leading/trailing whitespace.
+        """
+        return re.sub(r"\s+", " ", value or "").strip()
+
+    def _parse_text_slot_element(self, elem: ET.Element) -> Optional[Tuple[int, str]]:
+        """
+        Parse one defText/oneText element named F0..F9 into (slot, label).
+        """
+        if self._tag_name(elem) not in ("defText", "oneText"):
+            return None
+
+        name = (elem.attrib.get("name") or "").strip()
+        if not re.fullmatch(r"F\d", name):
+            return None
+
+        return int(name[1:]), self._clean_text_value(elem.text)
+
+    def _parse_wheel_names_xml(self, xml: str, prop: str) -> Dict[int, str]:
+        """
+        Extract F-slot labels from parsed INDI text-vector XML.
+
+        Full vector elements are preferred so device/property names can be
+        checked. If the vector is truncated before its closing tag, completed
+        defText/oneText child elements are still used as a fallback, matching
+        the secondary parser's partial-buffer recovery model.
+        """
+        elements = self._xml_elements(xml)
+        slotmap: Dict[int, str] = {}
+
+        for vec in elements:
+            tag = self._tag_name(vec)
+            if tag not in ("defTextVector", "setTextVector"):
+                continue
+
+            dev = (vec.attrib.get("device") or "").strip()
+            name = (vec.attrib.get("name") or "").strip()
+
+            if dev and dev != self.CONTROL_DEVICE:
+                continue
+            if name and name != prop:
+                continue
+
+            for child in list(vec):
+                parsed = self._parse_text_slot_element(child)
+                if parsed is not None:
+                    slot, label = parsed
+                    slotmap[slot] = label
+
+        # If the outer text vector was truncated, XMLPullParser can still
+        # salvage completed child elements even though the parent vector never
+        # produced an end event.
+        if not slotmap:
+            for elem in elements:
+                parsed = self._parse_text_slot_element(elem)
+                if parsed is not None:
+                    slot, label = parsed
+                    slotmap[slot] = label
+
+        return slotmap
+
     def getfilters(self, retries: int = 3, delay: float = 0.2) -> Dict[str, str]:
         """
-        Read current in-beam filter labels using QUERY_DEVICE IDMessage response.
-        Expects message like: upper:Clear lower:U
+        Read current in-beam filter labels using QUERY_DEVICE XML message response.
+        Expects message payload like: upper:Clear lower:U
         """
-        regex = re.compile(r'message="upper:(.+?)\s+lower:(.+?)"')
         last = None
 
         for _ in range(max(1, retries)):
             xml = self._send_recv(
                 f"<getProperties version='1.7' device='{self.QUERY_DEVICE}' />",
                 max_wait=max(1.5, self.cfg.timeout),
-                until=regex,
+                until=self._filters_until_re,
             )
             last = xml
-            m = regex.search(xml)
-            if m:
-                return {"upper": m.group(1).strip(), "lower": m.group(2).strip()}
+
+            parsed = self._parse_filters_xml(xml)
+            if parsed is not None:
+                return parsed
+
             time.sleep(delay)
 
-        raise RuntimeError(f"Could not parse FILTERS response: {last!r}")
+        raise RuntimeError(f"Could not parse FILTERS XML response: {last!r}")
 
     def get_wheel_names(self, wheel: str) -> Dict[int, str]:
         """
         Returns slot->label for wheel ('upper' or 'lower') by parsing the
-        text vector property LOWER_FNAMES / UPPER_FNAMES.
+        text vector property LOWER_FNAMES / UPPER_FNAMES as XML.
         """
         wheel = wheel.lower().strip()
         if wheel not in ("upper", "lower"):
@@ -130,23 +321,13 @@ class VattIndiGuidebox:
 
         prop = self.UPPER_NAMES_PROP if wheel == "upper" else self.LOWER_NAMES_PROP
 
-        until = re.compile(r'<(defText|oneText)\s+name="F4"')
         xml = self._send_recv(
             f"<getProperties version='1.7' device='{self.CONTROL_DEVICE}' name='{prop}' />",
             max_wait=max(1.5, self.cfg.timeout),
-            until=until
+            until=self._text_vector_done_re,
         )
 
-        # defText and oneText variants
-        slotmap: Dict[int, str] = {}
-
-        for name, val in re.findall(r'<defText\s+name="(F\d)".*?>(.*?)</defText>', xml, re.S):
-            idx = int(name[1:])
-            slotmap[idx] = re.sub(r"\s+", " ", val).strip()
-
-        for name, val in re.findall(r'<oneText\s+name="(F\d)".*?>(.*?)</oneText>', xml, re.S):
-            idx = int(name[1:])
-            slotmap[idx] = re.sub(r"\s+", " ", val).strip()
+        slotmap = self._parse_wheel_names_xml(xml, prop)
 
         # INDI event model might not provide us all 5 slots immediately. Just warn if too little appear (less than 3)
         # as something might be wrong.
@@ -177,36 +358,53 @@ class VattIndiGuidebox:
         self._send_recv(xml, max_wait=max(0.5, self.cfg.timeout))
 
 
+
 # =========================
-# Secondary (focus)
+# Secondary
 # =========================
 
 class VattIndiSecondary:
     """
-    Minimal polling-style INDI client for VATT Secondary focus (PosZ).
+    Minimal polling-style INDI client for VATT Secondary axes.
+
+    Supported logical axes:
+      - focus -> PosZ / Z
+      - tiltx -> PosV / V
+      - tilty -> PosU / U
 
     Protocol:
       - read a short buffer from INDI
       - parse XML elements by wrapping in a fake root
       - if buffer is truncated, use XMLPullParser to salvage complete stanzas
       - pick the latest setNumberVector (preferred) or defNumberVector (fallback)
-      - extract Z value + vector state
+      - extract axis value + vector state
     """
 
     DEVICE = "VATT Secondary"
-    FOCUS_PROP = "PosZ"
-    FOCUS_ELEM = "Z"
+
+    AXES = {
+        "focus": {"prop": "PosZ", "elem": "Z"},
+        "tiltx": {"prop": "PosV", "elem": "V"},
+        "tilty": {"prop": "PosU", "elem": "U"},
+    }
 
     def __init__(self, cfg: Optional[IndiConfig] = None):
         self.cfg = cfg or IndiConfig()
         self._tcp = IndiTcpClient(self.cfg)
 
-    def _read_posz_buffer(self, max_wait: Optional[float] = None) -> str:
+    def _axis_spec(self, axis: str) -> Dict[str, str]:
+        axis = (axis or "").strip().lower()
+        if axis not in self.AXES:
+            raise ValueError(f"Unknown secondary axis '{axis}'. Expected one of {list(self.AXES)}")
+        return self.AXES[axis]
+
+    def _read_axis_buffer(self, axis: str, max_wait: Optional[float] = None) -> str:
         if max_wait is None:
             max_wait = max(1.6, getattr(self.cfg, "timeout", 1.0))
 
+        spec = self._axis_spec(axis)
         return self._tcp.send_recv(
-            f"<getProperties version='1.7' device='{self.DEVICE}' name='{self.FOCUS_PROP}' />",
+            f"<getProperties version='1.7' device='{self.DEVICE}' name='{spec['prop']}' />",
             max_wait=max_wait,
             until=None,
         )
@@ -240,22 +438,25 @@ class VattIndiSecondary:
             # buffer was truncated; we already yielded any completed elements
             return
 
-    def _select_latest_posz_vector(self, buf: str) -> ET.Element:
+    def _select_latest_axis_vector(self, axis: str, buf: str) -> ET.Element:
         if not buf:
-            raise RuntimeError("Empty INDI response buffer.")
+            raise RuntimeError(f"Empty INDI response buffer for secondary axis '{axis}'.")
+
+        spec = self._axis_spec(axis)
+        prop = spec["prop"]
 
         candidates_set = []
         candidates_def = []
 
         try:
-            it = self._iter_vector_elements_wrapped(buf)
+            elements = list(self._iter_vector_elements_wrapped(buf))
         except ET.ParseError:
-            it = self._iter_vector_elements_pull(buf)
+            elements = list(self._iter_vector_elements_pull(buf))
 
-        for elem in it:
+        for elem in elements:
             dev = (elem.attrib.get("device") or "").strip()
             name = (elem.attrib.get("name") or "").strip()
-            if dev != self.DEVICE or name != self.FOCUS_PROP:
+            if dev != self.DEVICE or name != prop:
                 continue
 
             if elem.tag == "setNumberVector":
@@ -268,56 +469,64 @@ class VattIndiSecondary:
         if candidates_def:
             return candidates_def[-1]
 
-        raise RuntimeError(f"No {self.DEVICE}.{self.FOCUS_PROP} NumberVector found in buffer.")
+        raise RuntimeError(f"No {self.DEVICE}.{prop} NumberVector found in buffer for axis '{axis}'.")
 
-    def _parse_posz_vector(self, vec: ET.Element) -> Tuple[float, str]:
+    def _parse_axis_vector(self, axis: str, vec: ET.Element) -> Tuple[float, str]:
+        spec = self._axis_spec(axis)
+        elem_name = spec["elem"]
+
         state = (vec.attrib.get("state") or "").strip()
 
-        z_text = None
+        value_text = None
         for child in vec.findall(".//oneNumber") + vec.findall(".//defNumber"):
-            if (child.attrib.get("name") or "") == self.FOCUS_ELEM:
+            if (child.attrib.get("name") or "") == elem_name:
                 if child.text is not None:
-                    z_text = child.text.strip()
+                    value_text = child.text.strip()
                 break
 
-        if z_text is None:
-            raise RuntimeError("PosZ vector missing Z value.")
+        if value_text is None:
+            raise RuntimeError(f"{spec['prop']} vector missing {elem_name} value for axis '{axis}'.")
 
         try:
-            return float(z_text), state
+            return float(value_text), state
         except ValueError:
-            raise RuntimeError(f"PosZ Z value not numeric: {z_text!r}")
+            raise RuntimeError(
+                f"{spec['prop']} {elem_name} value not numeric for axis '{axis}': {value_text!r}"
+            )
 
-    def get_focus_z_and_state(self, retries: int = 3, delay: float = 0.15) -> Tuple[float, str]:
+    def get_axis_and_state(self, axis: str, retries: int = 3, delay: float = 0.15) -> Tuple[float, str]:
         last_buf = None
         for _ in range(max(1, retries)):
             try:
-                last_buf = self._read_posz_buffer()
-                vec = self._select_latest_posz_vector(last_buf)
-                return self._parse_posz_vector(vec)
+                last_buf = self._read_axis_buffer(axis)
+                vec = self._select_latest_axis_vector(axis, last_buf)
+                return self._parse_axis_vector(axis, vec)
             except Exception:
                 time.sleep(delay)
 
+        spec = self._axis_spec(axis)
         raise RuntimeError(
-            f"Could not read/parse {self.DEVICE}.{self.FOCUS_PROP}. "
+            f"Could not read/parse {self.DEVICE}.{spec['prop']} for axis '{axis}'. "
             f"last_buf_tail={(last_buf or '')[-500:]!r}"
         )
 
-    def get_focus_z(self, retries: int = 3, delay: float = 0.15) -> float:
-        z, _state = self.get_focus_z_and_state(retries=retries, delay=delay)
-        return z
+    def get_axis(self, axis: str, retries: int = 3, delay: float = 0.15) -> float:
+        value, _state = self.get_axis_and_state(axis, retries=retries, delay=delay)
+        return value
 
-    def set_focus_z(self, value: float) -> None:
+    def set_axis(self, axis: str, value: float) -> None:
+        spec = self._axis_spec(axis)
         v = float(value)
         xml = (
-            f"<newNumberVector device='{self.DEVICE}' name='{self.FOCUS_PROP}'>"
-            f"<oneNumber name='{self.FOCUS_ELEM}'>{v}</oneNumber>"
+            f"<newNumberVector device='{self.DEVICE}' name='{spec['prop']}'>"
+            f"<oneNumber name='{spec['elem']}'>{v}</oneNumber>"
             f"</newNumberVector>"
         )
         self._tcp.send_recv(xml, max_wait=max(0.5, getattr(self.cfg, "timeout", 1.0)), until=None)
 
-    def wait_focus(
+    def wait_axis(
         self,
+        axis: str,
         expected: float,
         tol: float = 0.5,
         settle_eps: float = 0.05,
@@ -330,11 +539,11 @@ class VattIndiSecondary:
         prev_val: Optional[float] = None
 
         while True:
-            cur, state = self.get_focus_z_and_state(retries=2, delay=0.1)
+            cur, state = self.get_axis_and_state(axis, retries=2, delay=0.1)
             state_norm = (state or "").strip().lower()
 
             if state_norm == "alert":
-                raise RuntimeError(f"Focus entered ALERT state (last={cur})")
+                raise RuntimeError(f"Secondary axis '{axis}' entered ALERT state (last={cur})")
 
             done_state = (state_norm == "ok")
             done_val = abs(cur - expected) <= tol
@@ -351,9 +560,40 @@ class VattIndiSecondary:
             prev_val = cur
 
             if (time.time() - t0) > timeout:
-                raise RuntimeError(f"Timeout waiting for focus {expected}. last={cur} state={state}")
+                raise RuntimeError(
+                    f"Timeout waiting for secondary axis '{axis}' to reach {expected}. "
+                    f"last={cur} state={state}"
+                )
 
             time.sleep(poll)
+
+    def get_focus_z_and_state(self, retries: int = 3, delay: float = 0.15) -> Tuple[float, str]:
+        return self.get_axis_and_state("focus", retries=retries, delay=delay)
+
+    def get_focus_z(self, retries: int = 3, delay: float = 0.15) -> float:
+        return self.get_axis("focus", retries=retries, delay=delay)
+
+    def set_focus_z(self, value: float) -> None:
+        self.set_axis("focus", value)
+
+    def wait_focus(
+        self,
+        expected: float,
+        tol: float = 0.5,
+        settle_eps: float = 0.05,
+        timeout: float = 30.0,
+        poll: float = 0.8,
+        min_wait: float = 1.2,
+    ) -> float:
+        return self.wait_axis(
+            "focus",
+            expected=expected,
+            tol=tol,
+            settle_eps=settle_eps,
+            timeout=timeout,
+            poll=poll,
+            min_wait=min_wait,
+        )
 
 
 # =========================
@@ -393,11 +633,11 @@ class VattInstrumentIndi(Instrument):
         self.secondary = VattIndiSecondary(
             IndiConfig(host="10.0.1.108", port=7600, timeout=1.0)
         )
+        
+        self._secondary_lock = threading.Lock()
 
-        self._focus_lock = threading.Lock()
-
-        # keep a local cached last focus
-        self._last_focus: Optional[float] = None
+        # keep local cached last values for secondary axes
+        self._last_secondary: Dict[str, float] = {}
 
     # -------- internal helpers (filters) --------
 
@@ -569,6 +809,47 @@ class VattInstrumentIndi(Instrument):
             # Return both wheels state
             return self.get_filter(filter_id=0)
 
+    # -------- internal helpers (secondary axes) --------
+
+    def _validate_focus_type(self, focus_type: str) -> str:
+        focus_type = (focus_type or "absolute").strip().lower()
+        if focus_type not in ("absolute", "step"):
+            raise azcam.exceptions.AzcamError("focus_type must be 'absolute' or 'step'")
+        return focus_type
+
+    def _get_secondary_axis(self, axis: str) -> float:
+        with self._secondary_lock:
+            value = self.secondary.get_axis(axis, retries=3)
+            self._last_secondary[axis] = value
+            return value
+
+    def _set_secondary_axis(self, axis: str, position, focus_type="absolute") -> float:
+        focus_type = self._validate_focus_type(focus_type)
+
+        with self._secondary_lock:
+            if focus_type == "absolute":
+                target = float(position)
+            else:
+                cur = self.secondary.get_axis(axis, retries=3)
+                delta = float(position)
+                target = cur + delta
+
+            azcam.log(f"Setting secondary axis '{axis}' to {target:.6f} ({focus_type})")
+
+            self.secondary.set_axis(axis, target)
+
+            final = self.secondary.wait_axis(
+                axis=axis,
+                expected=target,
+                tol=0.5,
+                settle_eps=0.05,
+                timeout=30.0,
+                poll=0.8,
+            )
+
+            self._last_secondary[axis] = final
+            return final
+
     # -------- required AzCam Instrument API: focus --------
 
     def get_focus(self, focus_id=0):
@@ -577,10 +858,7 @@ class VattInstrumentIndi(Instrument):
 
         focus_id currently unused (single focus mechanism).
         """
-        with self._focus_lock:
-            fp = self.secondary.get_focus_z(retries=3)
-            self._last_focus = fp
-            return fp
+        return self._get_secondary_axis("focus")
 
     def set_focus(self, focus_position, focus_id=0, focus_type="absolute"):
         """
@@ -592,32 +870,42 @@ class VattInstrumentIndi(Instrument):
 
         Returns the new focus as float.
         """
-        focus_type = (focus_type or "absolute").strip().lower()
-        if focus_type not in ("absolute", "step"):
-            raise azcam.exceptions.AzcamError("focus_type must be 'absolute' or 'step'")
+        return self._set_secondary_axis("focus", focus_position, focus_type=focus_type)
 
-        with self._focus_lock:
-            if focus_type == "absolute":
-                target = float(focus_position)
-            else:
-                cur = self.secondary.get_focus_z(retries=3)
-                delta = float(focus_position)
-                target = cur + delta
+    # -------- additional AzCam Instrument API: tilt --------
 
-            azcam.log(f"Setting focus (PosZ) to {target:.6f} ({focus_type})")
+    def get_tiltx(self):
+        """
+        Return current tilt X position.
+        """
+        return self._get_secondary_axis("tiltx")
 
-            # command move
-            self.secondary.set_focus_z(target)
+    def set_tiltx(self, tilt_position, focus_type="absolute"):
+        """
+        Move/step instrument tilt X.
 
-            # confirm
-            final = self.secondary.wait_focus(
-                expected=target,
-                tol=0.5,
-                settle_eps=0.05,
-                timeout=30.0,
-                poll=0.8,
-            )
+        focus_type:
+          - "absolute": set tilt X to tilt_position
+          - "step": add tilt_position delta to current tilt X
 
-            self._last_focus = final
-            return final
+        Returns the new tilt X as float.
+        """
+        return self._set_secondary_axis("tiltx", tilt_position, focus_type=focus_type)
 
+    def get_tilty(self):
+        """
+        Return current tilt Y position.
+        """
+        return self._get_secondary_axis("tilty")
+
+    def set_tilty(self, tilt_position, focus_type="absolute"):
+        """
+        Move/step instrument tilt Y.
+
+        focus_type:
+          - "absolute": set tilt Y to tilt_position
+          - "step": add tilt_position delta to current tilt Y
+
+        Returns the new tilt Y as float.
+        """
+        return self._set_secondary_axis("tilty", tilt_position, focus_type=focus_type)
